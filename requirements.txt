@@ -1,0 +1,10 @@
+opencv-python
+numpy
+requests
+filterpy
+torch
+ultralytics
+flask
+pyttsx3
+SpeechRecognition
+pyaudio
