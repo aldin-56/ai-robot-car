@@ -38,7 +38,7 @@ print("[✓] All imports done.\n")
 
 
 # ─────────────────────────────────────────
-# State enum
+# State & Task enum
 # ─────────────────────────────────────────
 
 class RobotState(Enum):
@@ -49,6 +49,138 @@ class RobotState(Enum):
     STOP     = "STOP"
     HOLD     = "HOLD"
     PATROL   = "PATROL"
+    TASK     = "TASK"
+
+
+class Task:
+    def __init__(self, name: str):
+        self.name = name
+        self.started = False
+        self.done = False
+
+    def execute(self, ai: 'RobotCarAI') -> str:
+        return "stop"
+
+
+class ExploreTask(Task):
+    def __init__(self):
+        super().__init__("Explore")
+        self.start_ts = 0
+
+    def execute(self, ai: 'RobotCarAI') -> str:
+        if not self.started:
+            self.started = True
+            self.start_ts = time.time()
+
+        if time.time() - self.start_ts > 15:
+            self.done = True
+            return "stop"
+
+        if ai.last_error_norm < -0.3: return "left"
+        if ai.last_error_norm > 0.3: return "right"
+        return "forward"
+
+
+class FindTask(Task):
+    def __init__(self, label: str):
+        super().__init__(f"Find({label})")
+        self.label = label
+
+    def execute(self, ai: 'RobotCarAI') -> str:
+        if ai.last_label == self.label and (time.time() - ai.last_det_time < 0.5):
+            self.done = True
+            return "stop"
+
+        # Simple search behavior
+        now = time.time()
+        if now - ai.last_search_switch > 2.0:
+            ai.search_left = not ai.search_left
+            ai.last_search_switch = now
+        return "left" if ai.search_left else "right"
+
+
+class GoToTask(Task):
+    def __init__(self, tx, ty):
+        super().__init__(f"GoTo({tx},{ty})")
+        self.tx, self.ty = tx, ty
+
+    def execute(self, ai: 'RobotCarAI') -> str:
+        dx = self.tx - ai.mapper.car_pos[0]
+        dy = self.ty - ai.mapper.car_pos[1]
+        dist = np.sqrt(dx*dx + dy*dy)
+        if dist < 1.0:
+            self.done = True
+            return "stop"
+
+        target_angle = np.degrees(np.arctan2(dy, dx))
+        diff_angle = (target_angle - ai.mapper.car_angle + 180) % 360 - 180
+
+        if abs(diff_angle) > 15:
+            return "left" if diff_angle < 0 else "right"
+        return "forward"
+
+
+class TaskManager:
+    def __init__(self):
+        self.queue: deque[Task] = deque()
+        self.current: Optional[Task] = None
+
+    def add(self, task: Task, priority=False):
+        if priority:
+            self.queue.appendleft(task)
+            self.current = None # Force switch
+        else:
+            self.queue.append(task)
+
+    def step(self, ai: 'RobotCarAI') -> str:
+        if not self.current:
+            if not self.queue: return "stop"
+            self.current = self.queue.popleft()
+
+        act = self.current.execute(ai)
+        if self.current.done:
+            self.current = None
+        return act
+
+
+# ─────────────────────────────────────────
+# Survival & Health
+# ─────────────────────────────────────────
+
+class SurvivalSystem:
+    def __init__(self, battery_level=100.0):
+        self.battery = battery_level
+        self.is_stuck = False
+        self.last_pos = [0.0, 0.0]
+        self.last_move_ts = time.time()
+        self.low_battery_threshold = 20.0
+
+    def update(self, ai: 'RobotCarAI', action: str):
+        # Deplete battery
+        if action != "stop":
+            self.battery -= 0.05
+        else:
+            self.battery -= 0.01
+
+        self.battery = max(0, self.battery)
+
+        # Stuck detection
+        now = time.time()
+        if action != "stop" and (now - self.last_move_ts) > 3.0:
+            dist = np.sqrt((ai.mapper.car_pos[0] - self.last_pos[0])**2 +
+                           (ai.mapper.car_pos[1] - self.last_pos[1])**2)
+            if dist < 0.2:
+                self.is_stuck = True
+            else:
+                self.is_stuck = False
+                self.last_pos = [ai.mapper.car_pos[0], ai.mapper.car_pos[1]]
+                self.last_move_ts = now
+        elif action == "stop":
+            self.last_move_ts = now
+            self.last_pos = [ai.mapper.car_pos[0], ai.mapper.car_pos[1]]
+
+    def needs_charge(self) -> bool:
+        return self.battery < self.low_battery_threshold
 
 
 # ─────────────────────────────────────────
@@ -56,16 +188,42 @@ class RobotState(Enum):
 # ─────────────────────────────────────────
 
 class AIBrain(nn.Module):
-    def __init__(self, input_size=6, hidden_size=32, output_size=5):
+    def __init__(self, input_size=7, hidden_size=64, output_size=5):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_size, hidden_size), nn.ReLU(),
             nn.Linear(hidden_size, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, output_size), nn.Softmax(dim=1),
+            nn.Linear(hidden_size, output_size),
         )
 
     def forward(self, x):
         return self.net(x)
+
+    def get_action(self, state_vec: List[float]) -> int:
+        self.eval()
+        with torch.no_grad():
+            t = torch.FloatTensor([state_vec])
+            out = self.forward(t)
+            return int(torch.argmax(out, dim=1).item())
+
+    def train_step(self, optimizer, s, a, r, s2, done, gamma=0.95):
+        self.train()
+        s_t = torch.FloatTensor([s])
+        s2_t = torch.FloatTensor([s2])
+
+        # Simple DQN-like update
+        target = r
+        if not done:
+            target = r + gamma * torch.max(self.forward(s2_t)).item()
+
+        output = self.forward(s_t)
+        actual = output[0][a]
+        loss = nn.MSELoss()(actual, torch.tensor(target, dtype=torch.float32))
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss.item()
 
 
 # ─────────────────────────────────────────
@@ -136,6 +294,57 @@ class RobotController:
 
 
 # ─────────────────────────────────────────
+# Mapping & SLAM
+# ─────────────────────────────────────────
+
+class MapManager:
+    def __init__(self, landmark_dist_threshold=2.0):
+        self.landmarks: List[Dict] = []  # List of {"x", "y", "label", "count"}
+        self.car_pos = [0.0, 0.0]
+        self.car_angle = 0.0
+        self.dist_threshold = landmark_dist_threshold
+
+    def update_odometry(self, action: str, move_speed: float, turn_speed: float):
+        if action == "forward":
+            self.car_pos[0] += move_speed * np.cos(np.radians(self.car_angle))
+            self.car_pos[1] += move_speed * np.sin(np.radians(self.car_angle))
+        elif action == "backward":
+            self.car_pos[0] -= move_speed * np.cos(np.radians(self.car_angle))
+            self.car_pos[1] -= move_speed * np.sin(np.radians(self.car_angle))
+        elif action == "left":
+            self.car_angle -= turn_speed
+        elif action == "right":
+            self.car_angle += turn_speed
+        self.car_angle %= 360
+
+    def add_landmark(self, rel_x: float, rel_y: float, label: str):
+        # Convert relative to absolute
+        rad = np.radians(self.car_angle)
+        abs_x = self.car_pos[0] + (rel_x * np.cos(rad) - rel_y * np.sin(rad))
+        abs_y = self.car_pos[1] + (rel_x * np.sin(rad) + rel_y * np.cos(rad))
+
+        # Check if landmark already exists nearby
+        found = False
+        for lm in self.landmarks:
+            dist = np.sqrt((lm["x"] - abs_x)**2 + (lm["y"] - abs_y)**2)
+            if dist < self.dist_threshold and lm["label"] == label:
+                # Simple moving average for landmark position
+                lm["x"] = lm["x"] * 0.9 + abs_x * 0.1
+                lm["y"] = lm["y"] * 0.9 + abs_y * 0.1
+                lm["count"] += 1
+                found = True
+                break
+
+        if not found:
+            self.landmarks.append({"x": abs_x, "y": abs_y, "label": label, "count": 1})
+            if len(self.landmarks) > 500:
+                self.landmarks.pop(0)
+
+    def get_map_data(self):
+        return [(lm["x"], lm["y"], lm["label"]) for lm in self.landmarks]
+
+
+# ─────────────────────────────────────────
 # Simple moving-average error filter
 # ─────────────────────────────────────────
 
@@ -192,22 +401,61 @@ class OllamaAgent:
             {"role": "system", "content": "You are a robot car's AI. Keep responses very short and witty."}
         ]
 
-    def chat(self, text: str) -> str:
-        self.history.append({"role": "user", "content": text})
+    def chat(self, text: str, ai: Optional['RobotCarAI'] = None) -> str:
+        context = ""
+        if ai:
+            context = (
+                f"\n[Status] Pos: {ai.mapper.car_pos}, Batt: {ai.survival.battery:.1f}%, "
+                f"State: {ai.state.value}, Landmarks: {len(ai.mapper.landmarks)}"
+            )
+
+        self.history.append({"role": "user", "content": text + context})
+
+        # Check for task-related keywords to see if we should return JSON
+        task_mode = any(kw in text.lower() for kw in ["go to", "find", "explore", "task"])
+
+        if task_mode:
+            self.history[-1]["content"] += "\nReply with JSON: {\"thought\": \"...\", \"task\": \"Explore|Find|GoTo\", \"params\": [...], \"speech\": \"...\"}"
+
         try:
             r = requests.post(
                 self.url,
                 json={"model": self.model, "messages": self.history, "stream": False},
-                timeout=5.0
+                timeout=8.0
             )
             r.raise_for_status()
-            # Ollama /api/chat returns a 'message' object
-            ans = r.json().get("message", {}).get("content", "I am thinking.")
+            ans = r.json().get("message", {}).get("content", "...")
             self.history.append({"role": "assistant", "content": ans})
-            if len(self.history) > 10: self.history.pop(1); self.history.pop(1)
+
+            if len(self.history) > 12:
+                self.history.pop(1)
+                self.history.pop(1)
+
+            if task_mode and "{" in ans:
+                try:
+                    s, e = ans.find("{"), ans.rfind("}")
+                    data = json.loads(ans[s:e+1])
+                    if ai: self._apply_task(data, ai)
+                    return data.get("speech", "Task accepted.")
+                except Exception:
+                    pass
+
             return ans
         except Exception:
             return "I lost my train of thought."
+
+    def _apply_task(self, data: dict, ai: 'RobotCarAI'):
+        t_type = data.get("task")
+        params = data.get("params", [])
+        if t_type == "Explore":
+            ai.tasks.add(ExploreTask())
+            ai.state = RobotState.TASK
+        elif t_type == "Find" and params:
+            ai.tasks.add(FindTask(params[0]))
+            ai.state = RobotState.TASK
+        elif t_type == "GoTo" and len(params) >= 2:
+            ai.tasks.add(GoToTask(params[0], params[1]))
+            ai.state = RobotState.TASK
 
 
 # ─────────────────────────────────────────
@@ -232,9 +480,9 @@ class RobotCarAI:
         self.last_ai_ts     = 0.0
 
         # Mapping State
-        self.map_data = [] # List of (x, y, type)
-        self.car_pos = [0.0, 0.0] # Virtual [x, y]
-        self.car_angle = 0.0 # In degrees
+        self.mapper = MapManager()
+        self.tasks  = TaskManager()
+        self.survival = SurvivalSystem()
 
         # State / memory
         self.state              = RobotState.SEARCH
@@ -358,6 +606,9 @@ class RobotCarAI:
             avg_x = np.mean([(o[0]+o[2])/2 for o in obs])
             return "right" if avg_x < self.frame_w/2 else "left"
 
+        if state == RobotState.TASK:
+            return self.tasks.step(self)
+
         if state == RobotState.SEARCH:
             now = time.time()
             if now - self.last_search_switch > 2.0:
@@ -434,9 +685,10 @@ class RobotCarAI:
                     text = rec.recognize_google(audio).lower()
                     print(f"You said: {text}")
                     if not self._parse_voice(text):
-                        # Not a command, so chat with Mistral
+                        # Not a hardcoded command, so chat with Mistral
                         if self.ai_brain_mode == "mistral":
-                            response = self.ollama.chat(text)
+                            # self is RobotCarAI, pass it for context
+                            response = self.ollama.chat(text, ai=self)
                             print(f"Robot: {response}")
                             self._speak(response)
                 except Exception:
@@ -453,6 +705,10 @@ class RobotCarAI:
                 self.voice_cmd = act
                 return True
         
+        if "explore" in cmd:
+            self.tasks.add(ExploreTask())
+            self.voice_state = RobotState.TASK
+            return True
         if "search" in cmd:
             self.voice_state = RobotState.SEARCH
             return True
@@ -486,9 +742,11 @@ class RobotCarAI:
             f"State:  {state.value}",
             f"Action: {action}",
             f"AI:     {ai_src}",
-            f"Pos:    ({self.car_pos[0]:.1f}, {self.car_pos[1]:.1f})",
-            f"Angle:  {self.car_angle:.0f}",
+            f"Pos:    ({self.mapper.car_pos[0]:.1f}, {self.mapper.car_pos[1]:.1f})",
+            f"Angle:  {self.mapper.car_angle:.0f}",
             f"Target: {self.target_label}",
+            f"Task:   {self.tasks.current.name if self.tasks.current else 'None'}",
+            f"Batt:   {self.survival.battery:.1f}%",
         ]
         for i, ln in enumerate(lines):
             cv2.putText(frame, ln, (10, 24 + i*22),
@@ -505,9 +763,9 @@ class RobotCarAI:
         cv2.circle(frame, center, 3, (0,255,255), -1)
         
         # Draw map dots
-        for mx, my, mlbl in self.map_data:
-            dx = int((mx - self.car_pos[0]) * 2)
-            dy = int((my - self.car_pos[1]) * 2)
+        for mx, my, mlbl in self.mapper.get_map_data():
+            dx = int((mx - self.mapper.car_pos[0]) * 2)
+            dy = int((my - self.mapper.car_pos[1]) * 2)
             pt = (center[0] + dx, center[1] + dy)
             if map_origin[0] < pt[0] < w-10 and map_origin[1] < pt[1] < h-10:
                 cv2.circle(frame, pt, 1, (0,0,255), -1)
@@ -594,8 +852,20 @@ class RobotCarAI:
 
                 # Decide
                 self.state = self._select_state(detected, err, close)
+
+                # Input vector for neural/RL: [err, close, obstacles, batt, state_idx, detected, angle]
+                state_list = list(RobotState)
+                state_idx = state_list.index(self.state) if self.state in state_list else 0
+                curr_vec = [float(err), float(close), float(len(obs)),
+                            self.survival.battery/100.0, float(state_idx),
+                            1.0 if detected else 0.0, self.mapper.car_angle/360.0]
+
                 if self.ai_brain_mode == "mistral":
                     action, ai_src = self._mistral_action(self.state, err, close, obs, detected)
+                elif self.ai_brain_mode == "neural":
+                    idx = self.ai_brain.get_action(curr_vec)
+                    action = ["stop", "left", "right", "forward", "backward"][idx]
+                    ai_src = "neural"
                 else:
                     action, ai_src = self._select_action(self.state, err, close, obs), "classic"
 
@@ -608,13 +878,23 @@ class RobotCarAI:
                     action = self.voice_cmd
                     self.voice_cmd = None
 
-                # Q-Learning update
+                # Q-Learning / Neural update
+                rwd = (0.5 if detected and close > 0.3 else -0.1) - (0.2 if obs else 0.0)
+                if self.survival.is_stuck: rwd -= 5.0
+
                 cur_rl = (round(err,2), round(close,2), len(obs), self.state.value)
                 if self.last_rl_state is not None:
-                    rwd = (0.5 if detected and close > 0.3 else -0.1) - (0.2 if obs else 0.0)
                     self.rl_agent.learn(self.last_rl_state, self.last_rl_action, rwd, cur_rl)
+
+                    # Also train the Neural Brain online
+                    actions_list = ["stop", "left", "right", "forward", "backward"]
+                    act_idx = actions_list.index(action) if action in actions_list else 0
+                    if hasattr(self, 'last_vec'):
+                        self.ai_brain.train_step(self.optimizer, self.last_vec, act_idx, rwd, curr_vec, False)
+
                 self.last_rl_state  = cur_rl
                 self.last_rl_action = action
+                self.last_vec = curr_vec
 
                 # Execute motor command
                 {"forward": self.robot.forward,
@@ -623,36 +903,39 @@ class RobotCarAI:
                  "right":   self.robot.right,
                  "stop":    self.robot.stop}.get(action, self.robot.stop)()
 
+                # Survival logic
+                self.survival.update(self, action)
+                if self.survival.needs_charge() and not isinstance(self.tasks.current, GoToTask):
+                     print("[!] Low Battery - Returning to Home")
+                     self.tasks.add(GoToTask(0, 0), priority=True)
+                     self.state = RobotState.TASK
+
+                if self.survival.is_stuck:
+                    print("[!] Robot STUCK - Attempting escape")
+                    self.robot.backward()
+                    time.sleep(0.5)
+                    self.robot.left()
+                    time.sleep(0.5)
+                    self.survival.is_stuck = False
+
                 # ── Mapper / Odometry ────────────────
-                # (Simple estimation based on time/command)
-                move_speed = 0.5 # units per iteration
-                turn_speed = 5.0 # degrees per iteration
-                
-                if action == "forward":
-                    self.car_pos[0] += move_speed * np.cos(np.radians(self.car_angle))
-                    self.car_pos[1] += move_speed * np.sin(np.radians(self.car_angle))
-                elif action == "backward":
-                    self.car_pos[0] -= move_speed * np.cos(np.radians(self.car_angle))
-                    self.car_pos[1] -= move_speed * np.sin(np.radians(self.car_angle))
-                elif action == "left":
-                    self.car_angle -= turn_speed
-                elif action == "right":
-                    self.car_angle += turn_speed
+                move_speed = 0.8 if action == "forward" else (0.5 if action == "backward" else 0.0)
+                turn_speed = 8.0 if action in ("left", "right") else 0.0
+                if action == "left": turn_speed = -turn_speed
+
+                self.mapper.update_odometry(action, move_speed, abs(turn_speed))
 
                 # Record obstacles in map
                 for ox1, oy1, ox2, oy2, lbl in obs:
-                    # Estimate distance/angle to obstacle relative to car
                     obj_center_x = (ox1 + ox2) / 2
-                    rel_angle = (obj_center_x - self.frame_w/2) / (self.frame_w/2) * 30 # assume 60deg FOV
-                    abs_angle = self.car_angle + rel_angle
-                    # Estimate distance based on box size
-                    dist = 10.0 / ((ox2 - ox1) / self.frame_w) # very rough estimate
+                    rel_angle_deg = (obj_center_x - self.frame_w/2) / (self.frame_w/2) * 30
+                    dist = 12.0 / (max(0.01, (ox2 - ox1) / self.frame_w))
                     
-                    obj_x = self.car_pos[0] + dist * np.cos(np.radians(abs_angle))
-                    obj_y = self.car_pos[1] + dist * np.sin(np.radians(abs_angle))
-                    self.map_data.append((obj_x, obj_y, lbl))
-                    # Keep map small for performance
-                    if len(self.map_data) > 200: self.map_data.pop(0)
+                    # Convert polar (dist, rel_angle) to relative Cartesian (rel_x, rel_y)
+                    # rel_x is forward, rel_y is side
+                    rel_x = dist * np.cos(np.radians(rel_angle_deg))
+                    rel_y = dist * np.sin(np.radians(rel_angle_deg))
+                    self.mapper.add_landmark(rel_x, rel_y, lbl)
 
                 # Speech feedback
                 _speak_map = {
@@ -698,7 +981,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera-flush",   type=int,   default=2,                help="Discard N buffered frames per loop")
     p.add_argument("--esp-timeout",    type=float, default=0.08,             help="ESP HTTP timeout (s)")
     p.add_argument("--voice",          action="store_true",                  help="Enable voice feedback & commands")
-    p.add_argument("--ai-brain",       default="classic", choices=["classic","mistral"], help="Decision mode")
+    p.add_argument("--ai-brain",       default="classic", choices=["classic","mistral","neural"], help="Decision mode")
     p.add_argument("--mistral-model",  default="mistral",                    help="Ollama model name")
     p.add_argument("--ollama-url",     default="http://127.0.0.1:11434/api/generate")
     p.add_argument("--mistral-timeout",type=float, default=0.12)
