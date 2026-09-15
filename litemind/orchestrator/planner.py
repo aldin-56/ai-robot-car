@@ -24,7 +24,9 @@ class WorkflowPlanner:
         lower_req = user_request.lower()
 
         # Identify output intention
-        if "presentation" in lower_req or "slide" in lower_req or "pptx" in lower_req:
+        if "comic" in lower_req or output_type == "comic":
+            target_output = "comic"
+        elif "presentation" in lower_req or "slide" in lower_req or "pptx" in lower_req:
             target_output = "presentation"
         elif "pdf" in lower_req or "doc" in lower_req or "report" in lower_req or "paper" in lower_req:
             target_output = "document"
@@ -49,6 +51,8 @@ class WorkflowPlanner:
         id_write_report = f"task_write_report_{prefix}"
         id_compile_pdf = f"task_compile_pdf_{prefix}"
         id_write_code = f"task_write_code_{prefix}"
+        id_write_comic = f"task_write_comic_{prefix}"
+        id_compile_comic = f"task_compile_comic_{prefix}"
         id_quality_review = f"task_quality_review_{prefix}"
 
         if file_context:
@@ -75,7 +79,48 @@ class WorkflowPlanner:
             research_dep = []
 
         # Step 2: Content Writing / Structure Generation
-        if target_output == "presentation":
+        if target_output == "comic":
+            tasks.append({
+                "id": id_write_comic,
+                "task_name": "Generate 8-Panel Comic Script & Storyboard (2 Width x 4 Long)",
+                "category": "LLM",
+                "required_capability": "text",
+                "dependencies": research_dep,
+                "input_prompt": (
+                    f"Create a vibrant color comic strip script for: '{user_request}'.\n"
+                    f"Format the comic as exactly 8 panels arranged in a 2-width by 4-long grid (2 columns x 4 rows).\n"
+                    f"For each panel (1 to 8), provide: title, visual image prompt description, caption, and dialogue."
+                )
+            })
+
+            tasks.append({
+                "id": id_generate_images,
+                "task_name": "Generate Color Comic Panel Visuals",
+                "category": "Image Generation",
+                "required_capability": "image_generation",
+                "dependencies": [id_write_comic],
+                "input_prompt": f"Create colorful vibrant comic book illustration panels for: {user_request}"
+            })
+
+            tasks.append({
+                "id": id_compile_comic,
+                "task_name": "Compile 4-Long x 2-Width Color Comic Grid Image & Artifacts",
+                "category": "Document Generation",
+                "required_capability": "pdf_generation",
+                "dependencies": [id_write_comic, id_generate_images],
+                "input_prompt": "Compile comic panels into a 2-column by 4-row (2-width x 4-long) color comic strip."
+            })
+
+            tasks.append({
+                "id": id_quality_review,
+                "task_name": "Evaluate & Verify Comic Quality & Grid Layout",
+                "category": "Quality Control",
+                "required_capability": "quality_review",
+                "dependencies": [id_compile_comic],
+                "input_prompt": "Evaluate story coherence, color quality, and panel layout."
+            })
+
+        elif target_output == "presentation":
             tasks.append({
                 "id": id_write_content,
                 "task_name": "Generate Presentation Outline & Slide Deck Structure",
