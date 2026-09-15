@@ -47,6 +47,32 @@ def test_workflow_planner():
     assert "Presentation Generation" in task_categories
 
 
+def test_comic_workflow_planner():
+    user_req = "Create a color comic about space exploration in a 4 long and 2 width grid"
+    plan = WorkflowPlanner.analyze_goal_and_plan(user_req, output_type="comic")
+    assert plan["output_type"] == "comic"
+    assert len(plan["tasks"]) >= 4
+    task_names = " ".join([t["task_name"] for t in plan["tasks"]])
+    assert "Comic Script" in task_names or "Comic" in task_names
+
+
+def test_comic_export_service():
+    outputs = {
+        "task_comic": {
+            "title": "Space Explorer Comic",
+            "panels": [
+                {"panel_number": i + 1, "title": f"Panel {i+1}", "caption": f"Space travel step {i+1}", "dialogue": f"Astronaut: Step {i+1} rocket launch!"}
+                for i in range(8)
+            ]
+        }
+    }
+    artifacts = ExportService.compile_project_artifacts("Space Explorer Comic", "comic", outputs)
+    assert len(artifacts) >= 3
+    comic_art = [a for a in artifacts if "Comic_Strip.png" in a["filename"] or a["type"] == "Color Comic Strip Image (.png)"]
+    assert len(comic_art) == 1
+    assert os.path.exists(os.path.join("exports", comic_art[0]["filename"]))
+
+
 def test_file_processor():
     sample_txt = b"Climate change refers to long-term shifts in temperatures and weather patterns."
     extracted = FileProcessor.extract_text_from_file("climate_report.txt", sample_txt)
@@ -94,3 +120,22 @@ def test_api_endpoints():
     exec_data = exec_res.json()
     assert exec_data["success"] is True
     assert len(exec_data["artifacts"]) >= 2
+
+    # Test Comic Generation End-to-End API Call
+    comic_create_res = client.post("/api/projects/create", data={
+        "request_text": "Create a color comic strip about a hero robot saving the forest in a 4 long 2 width grid",
+        "output_type": "comic"
+    })
+    assert comic_create_res.status_code == 200
+    comic_data = comic_create_res.json()
+    assert comic_data["output_type"] == "comic"
+
+    comic_wf_id = comic_data["workflow_id"]
+    comic_exec_res = client.post(f"/api/workflows/{comic_wf_id}/execute")
+    assert comic_exec_res.status_code == 200
+    comic_exec_data = comic_exec_res.json()
+    assert comic_exec_data["success"] is True
+
+    # Check comic artifact created
+    has_comic_artifact = any(a.get("type") == "Color Comic Strip Image (.png)" or "_comic.png" in a.get("filename", "") for a in comic_exec_data["artifacts"])
+    assert has_comic_artifact is True

@@ -28,7 +28,78 @@ class LocalLLMAdapter(BaseAdapter):
         goal = payload.get("goal", "the requested topic")
         json_mode = payload.get("json_mode", False)
 
-        if "presentation" in prompt.lower() or "slide" in prompt.lower():
+        if "comic" in prompt.lower() or "panel" in prompt.lower():
+            res_data = {
+                "title": f"Comic Strip: {goal[:40]}",
+                "layout": "2-width x 4-long grid (8 panels)",
+                "panels": [
+                    {
+                        "panel_number": 1,
+                        "row": 1, "col": 1,
+                        "title": "Panel 1: The Inciting Incident",
+                        "visual_prompt": f"Bright colorful comic art showing the main characters encountering {goal}.",
+                        "caption": f"It all began when the journey of {goal} started...",
+                        "dialogue": "Hero: Look! Something amazing is happening!"
+                    },
+                    {
+                        "panel_number": 2,
+                        "row": 1, "col": 2,
+                        "title": "Panel 2: The Setup",
+                        "visual_prompt": f"Comic action frame exploring {goal} in detail.",
+                        "caption": "Understanding the core power and potential.",
+                        "dialogue": "Sidekick: This could change everything!"
+                    },
+                    {
+                        "panel_number": 3,
+                        "row": 2, "col": 1,
+                        "title": "Panel 3: The Rising Action",
+                        "visual_prompt": f"Dynamic comic illustration of characters working with {goal}.",
+                        "caption": "Deepening our knowledge step by step.",
+                        "dialogue": "Mentor: Pay close attention to the details!"
+                    },
+                    {
+                        "panel_number": 4,
+                        "row": 2, "col": 2,
+                        "title": "Panel 4: The Twist",
+                        "visual_prompt": f"Surprising dramatic comic panel scene for {goal}.",
+                        "caption": "An unexpected event changes the path forward.",
+                        "dialogue": "Hero: Whoa! I didn't see that coming!"
+                    },
+                    {
+                        "panel_number": 5,
+                        "row": 3, "col": 1,
+                        "title": "Panel 5: The Climax",
+                        "visual_prompt": f"High energy action visual representing the peak moment of {goal}.",
+                        "caption": "Facing the ultimate test with full determination.",
+                        "dialogue": "Hero: We have to combine our strength now!"
+                    },
+                    {
+                        "panel_number": 6,
+                        "row": 3, "col": 2,
+                        "title": "Panel 6: The Breakthrough",
+                        "visual_prompt": f"Glowing victorious comic artwork depicting success.",
+                        "caption": "A brilliant breakthrough lights up the horizon.",
+                        "dialogue": "Sidekick: We did it! It worked!"
+                    },
+                    {
+                        "panel_number": 7,
+                        "row": 4, "col": 1,
+                        "title": "Panel 7: The Resolution",
+                        "visual_prompt": f"Warm happy comic scene reflecting on achievements in {goal}.",
+                        "caption": "The community celebrates the new transformation.",
+                        "dialogue": "Mentor: Wisdom and effort always triumph."
+                    },
+                    {
+                        "panel_number": 8,
+                        "row": 4, "col": 2,
+                        "title": "Panel 8: The Future",
+                        "visual_prompt": f"Inspiring colorful comic panel looking toward future adventures with {goal}.",
+                        "caption": "And so a new chapter begins for everyone.",
+                        "dialogue": "Hero: Ready for the next adventure!"
+                    }
+                ]
+            }
+        elif "presentation" in prompt.lower() or "slide" in prompt.lower():
             res_data = {
                 "title": f"Presentation on {goal[:40]}",
                 "slides": [

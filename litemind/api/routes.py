@@ -292,6 +292,7 @@ async def create_project_and_workflow(
         "project_id": project.id,
         "workflow_id": workflow.id,
         "title": project.title,
+        "output_type": project.output_type,
         "tasks_count": len(plan["tasks"])
     }
 
